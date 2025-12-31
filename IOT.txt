@@ -1,0 +1,225 @@
+import cv2
+import pytesseract
+import RPi.GPIO as GPIO
+import time
+from mfrc522 import SimpleMFRC522
+
+# --- CONFIGURATION ---
+# Camera Settings
+CAMERA_INDEX = 0             # Try 0 first. If fails, change to 1.
+TARGET_PLATE = "534"         # The number we are looking for
+
+# RFID Settings
+VALID_RFID_ID = 894924316535 
+
+# Timing Settings
+GATE_OPEN_TIME = 5           # Seconds the gate stays open
+CAMERA_CHECK_INTERVAL = 2.0  # Check camera every 2 seconds (Prevents lag)
+
+# --- GPIO PINOUT (BCM) ---
+SERVO_PIN = 18
+
+# Slot 1
+IR_SLOT1 = 23
+LED_S1_GREEN = 27
+LED_S1_RED = 22
+
+# Slot 2
+IR_SLOT2 = 24
+LED_S2_GREEN = 5
+LED_S2_RED = 6
+
+# Exit Sensor
+US_EXIT_TRIG = 20
+US_EXIT_ECHO = 21
+
+# --- SETUP ---
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+
+# 1. Setup Servo
+GPIO.setup(SERVO_PIN, GPIO.OUT)
+servo = GPIO.PWM(SERVO_PIN, 50) 
+servo.start(0)
+
+# 2. Setup LEDs
+leds = [LED_S1_GREEN, LED_S1_RED, LED_S2_GREEN, LED_S2_RED]
+for pin in leds:
+    GPIO.setup(pin, GPIO.OUT)
+    GPIO.output(pin, GPIO.LOW)
+
+# 3. Setup Sensors
+GPIO.setup(IR_SLOT1, GPIO.IN)
+GPIO.setup(IR_SLOT2, GPIO.IN)
+GPIO.setup(US_EXIT_TRIG, GPIO.OUT)
+GPIO.setup(US_EXIT_ECHO, GPIO.IN)
+
+# 4. Setup RFID
+reader = SimpleMFRC522()
+
+# Global Variables
+last_cam_check_time = 0
+last_slot1_state = -1
+last_slot2_state = -1
+
+# --- FUNCTIONS ---
+
+def log(message):
+    print(f"[{time.strftime('%H:%M:%S')}] {message}")
+
+def control_gate(reason):
+    log(f"GATE: Opening for {reason}...")
+    servo.ChangeDutyCycle(7)  # Open (approx 90 deg)
+    time.sleep(0.5)
+    servo.ChangeDutyCycle(0)  # Stop motor jitter
+    
+    time.sleep(GATE_OPEN_TIME)
+    
+    log("GATE: Closing...")
+    servo.ChangeDutyCycle(2)  # Close (approx 0 deg)
+    time.sleep(0.5)
+    servo.ChangeDutyCycle(0)
+
+def get_distance():
+    GPIO.output(US_EXIT_TRIG, True)
+    time.sleep(0.00001)
+    GPIO.output(US_EXIT_TRIG, False)
+
+    start_time = time.time()
+    stop_time = time.time()
+    timeout = time.time()
+    
+    # Wait for echo to go HIGH
+    while GPIO.input(US_EXIT_ECHO) == 0:
+        start_time = time.time()
+        if time.time() - timeout > 0.1: return 100
+
+    # Wait for echo to go LOW
+    while GPIO.input(US_EXIT_ECHO) == 1:
+        stop_time = time.time()
+        if time.time() - timeout > 0.1: return 100
+
+    return ((stop_time - start_time) * 34300) / 2
+
+def update_slots():
+    global last_slot1_state, last_slot2_state
+    
+    # Check Slot 1
+    s1 = GPIO.input(IR_SLOT1)
+    if s1 != last_slot1_state:
+        if s1 == 0: 
+            GPIO.output(LED_S1_RED, GPIO.HIGH)
+            GPIO.output(LED_S1_GREEN, GPIO.LOW)
+            log("FEEDBACK: Slot 1 OCCUPIED")
+        else:
+            GPIO.output(LED_S1_RED, GPIO.LOW)
+            GPIO.output(LED_S1_GREEN, GPIO.HIGH)
+            log("FEEDBACK: Slot 1 FREE")
+        last_slot1_state = s1
+
+    # Check Slot 2
+    s2 = GPIO.input(IR_SLOT2)
+    if s2 != last_slot2_state:
+        if s2 == 0: 
+            GPIO.output(LED_S2_RED, GPIO.HIGH)
+            GPIO.output(LED_S2_GREEN, GPIO.LOW)
+            log("FEEDBACK: Slot 2 OCCUPIED")
+        else:
+            GPIO.output(LED_S2_RED, GPIO.LOW)
+            GPIO.output(LED_S2_GREEN, GPIO.HIGH)
+            log("FEEDBACK: Slot 2 FREE")
+        last_slot2_state = s2
+
+def check_usb_lpr():
+    """
+    Connects to USB camera, takes ONE picture, disconnects, and runs OCR.
+    This prevents 'Frame Drop' issues.
+    """
+    # 1. Connect to Camera
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    
+    # Force MJPG (Fixes bandwidth issues on Pi USB)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+    
+    if not cap.isOpened():
+        log("CAM ERROR: Could not open USB Camera.")
+        return False
+
+    # 2. Read Frame
+    ret, frame = cap.read()
+    
+    # 3. Disconnect Immediately
+    cap.release()
+    
+    if not ret:
+        log("CAM ERROR: Camera opened but returned empty frame.")
+        return False
+
+    # 4. Process Image (LPR Logic)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    
+    # Binary Threshold (Black & White)
+    gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+
+    # 5. Tesseract OCR
+    # --psm 8 treats the image as a single word/block (Best for plates)
+    text = pytesseract.image_to_string(gray, config='--oem 3 --psm 8')
+    
+    # Clean text (Keep only letters and numbers)
+    clean_text = "".join(e for e in text if e.isalnum()).upper()
+
+    # 6. Check Match
+    if len(clean_text) > 1:
+        log(f"CAM SEES: '{clean_text}'")
+        
+        if TARGET_PLATE in clean_text:
+            log(f"MATCH FOUND: '{TARGET_PLATE}'")
+            return True
+            
+    return False
+
+def check_rfid():
+    # Non-blocking check for RFID tag
+    id, text = reader.read_no_block()
+    if id:
+        log(f"RFID SCANNED: {id}")
+        if id == VALID_RFID_ID:
+            log("ACCESS GRANTED: RFID Valid")
+            return True
+        else:
+            log("ACCESS DENIED: Invalid RFID")
+    return False
+
+# --- MAIN LOOP ---
+try:
+    log("SYSTEM READY: USB LPR Mode")
+    update_slots() 
+
+    while True:
+        # 1. Check Parking Slots (Instant)
+        update_slots()
+
+        # 2. Check Exit Sensor (Instant)
+        dist = get_distance()
+        if dist < 15:
+            log(f"FEEDBACK: Car Exiting ({dist:.1f}cm)")
+            control_gate("Exit Sensor")
+            time.sleep(2) 
+
+        # 3. Check RFID (Instant)
+        if check_rfid():
+            control_gate("RFID Access")
+
+        # 4. Check USB Camera (Interval)
+        # We check the camera once every 2 seconds to save CPU
+        if (time.time() - last_cam_check_time) > CAMERA_CHECK_INTERVAL:
+            if check_usb_lpr():
+                control_gate("License Plate Match")
+            last_cam_check_time = time.time()
+
+        # Small delay to reduce CPU usage
+        time.sleep(0.05)
+
+except KeyboardInterrupt:
+    log("SYSTEM STOPPING...")
+    GPIO.cleanup()
